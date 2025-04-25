@@ -1,0 +1,12 @@
+# Telegram bot token
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+
+# Gemini API key
+GEMINI_API_KEY=your_gemini_api_key_here
+
+# Required channel and group IDs
+REQUIRED_CHANNEL_ID=@your_channel_username
+REQUIRED_GROUP_ID=@your_group_username
+
+# Admin IDs (comma-separated list)
+ADMIN_IDS=123456789,987654321
