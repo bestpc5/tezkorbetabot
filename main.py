@@ -1,435 +1,330 @@
 import os
-import logging
 import sqlite3
+import random
+import schedule
+import time
+import asyncio
 from datetime import datetime
-from functools import wraps
-
-from aiogram import Bot, Dispatcher, types, executor
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.dispatcher.filters import Text
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
 from dotenv import load_dotenv
+import logging
 
 # Load environment variables
 load_dotenv()
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # e.g., "@YourChannel"
+GROUP_ID = os.getenv("GROUP_ID")  # e.g., "@YourGroup"
+WEBSITE_URL = os.getenv("WEBSITE_URL")  # e.g., "https://yourwebsite.com"
+ADMIN_IDS = [int(id) for id in os.getenv("ADMIN_IDS").split(",")]  # Comma-separated admin IDs
+MOTIVATION_GROUP_ID = os.getenv("MOTIVATION_GROUP_ID")  # Group for motivation submissions
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-
-# Bot token from environment variable
-API_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-REQUIRED_CHANNEL_ID = os.getenv('REQUIRED_CHANNEL_ID')
-REQUIRED_GROUP_ID = os.getenv('REQUIRED_GROUP_ID')
-ADMIN_IDS = os.getenv('ADMIN_IDS', '').split(',')  # List of admin IDs
-
-# Initialize bot and dispatcher
-bot = Bot(token=API_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(bot, storage=storage)
-dp.middleware.setup(LoggingMiddleware())
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configure Gemini AI
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-pro')
 
-# Initialize database
-conn = sqlite3.connect('bot_database.db')
-cursor = conn.cursor()
+# Database setup
+def init_db():
+    conn = sqlite3.connect('bot.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, is_active INTEGER)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS motivations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        text TEXT, 
+        submitted_by INTEGER, 
+        status TEXT, 
+        schedule_date TEXT,
+        message_id INTEGER
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS broadcasts (id INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT, media TEXT)''')
+    conn.commit()
+    conn.close()
 
-# Create users table
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    username TEXT,
-    first_name TEXT,
-    last_name TEXT,
-    is_admin INTEGER DEFAULT 0,
-    joined_date TEXT,
-    last_active TEXT
-)
-''')
-
-# Create conversation history table
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS conversations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    message TEXT,
-    response TEXT,
-    timestamp TEXT,
-    FOREIGN KEY (user_id) REFERENCES users (user_id)
-)
-''')
-
-conn.commit()
-
-# States for the conversation
-class AdminStates(StatesGroup):
-    waiting_for_admin_id = State()
-    waiting_for_admin_action = State()
-    waiting_for_message = State()
-
-
-# Check if user is subscribed to channel and group
-async def check_subscription(user_id):
+# Check membership
+async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
-        # Check channel subscription
-        channel_member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL_ID, user_id=user_id)
-        # Check group subscription
-        group_member = await bot.get_chat_member(chat_id=REQUIRED_GROUP_ID, user_id=user_id)
-        
-        # If user is a member of both
-        return (channel_member.status in ['member', 'administrator', 'creator'] and 
-                group_member.status in ['member', 'administrator', 'creator'])
+        channel_status = await context.bot.get_chat_member(CHANNEL_ID, user_id)
+        group_status = await context.bot.get_chat_member(GROUP_ID, user_id)
+        return channel_status.status in ['member', 'administrator', 'creator'] and \
+               group_status.status in ['member', 'administrator', 'creator']
     except Exception as e:
-        logging.error(f"Error checking subscription: {e}")
+        logger.error(f"Error checking membership: {e}")
         return False
 
+# Main keyboard
+def get_main_keyboard():
+    keyboard = [
+        ["Yordam", "Biz haqimizda"],
+        ["Kanal", "Guruh", "Veb sayt"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# Admin-only decorator
-def admin_required(func):
-    @wraps(func)
-    async def wrapped(message, *args, **kwargs):
-        user_id = str(message.from_user.id)
-        
-        # Check if user is in the admin list or database
-        cursor.execute("SELECT is_admin FROM users WHERE user_id = ?", (user_id,))
-        result = cursor.fetchone()
-        
-        if user_id in ADMIN_IDS or (result and result[0] == 1):
-            return await func(message, *args, **kwargs)
-        else:
-            await message.answer("Bu funksiya faqat adminlar uchun.")
-            return
-    return wrapped
+# Inline keyboard for membership
+def get_membership_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("Kanalga a'zo bo'lish", url=f"https://t.me/{CHANNEL_ID[1:]}")],
+        [InlineKeyboardButton("Guruhga a'zo bo'lish", url=f"https://t.me/{GROUP_ID[1:]}")],
+        [InlineKeyboardButton("Tekshirish", callback_data="check_membership")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-
-# Helper to save user to database
-def save_user(user):
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    cursor.execute("""
-    INSERT OR IGNORE INTO users (user_id, username, first_name, last_name, joined_date, last_active) 
-    VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        user.id, 
-        user.username if user.username else '', 
-        user.first_name if user.first_name else '', 
-        user.last_name if user.last_name else '', 
-        current_time, 
-        current_time
-    ))
-    
-    # Update last active if user already exists
-    cursor.execute("""
-    UPDATE users SET last_active = ? WHERE user_id = ?
-    """, (current_time, user.id))
-    
+# Start command
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    conn = sqlite3.connect('bot.db')
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO users (user_id, username, is_active) VALUES (?, ?, ?)", 
+              (user_id, update.effective_user.username, 1))
     conn.commit()
+    conn.close()
 
-
-# Save conversation to database
-def save_conversation(user_id, message, response):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    cursor.execute("""
-    INSERT INTO conversations (user_id, message, response, timestamp) 
-    VALUES (?, ?, ?, ?)
-    """, (user_id, message, response, timestamp))
-    
-    conn.commit()
-
-
-# Create subscription keyboard
-def get_subscription_keyboard():
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton("Kanalga a'zo bo'lish", url=f"https://t.me/{REQUIRED_CHANNEL_ID.replace('@', '')}"),
-        InlineKeyboardButton("Guruhga qo'shilish", url=f"https://t.me/{REQUIRED_GROUP_ID.replace('@', '')}"),
-        InlineKeyboardButton("A'zolikni tekshirish", callback_data="check_subscription")
-    )
-    return keyboard
-
-
-# Create admin keyboard
-def get_admin_keyboard():
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add(KeyboardButton("📊 Admin statistikasi"))
-    keyboard.add(KeyboardButton("👤 Admin qo'shish"), KeyboardButton("🚫 Adminlikdan olish"))
-    keyboard.add(KeyboardButton("📝 Barcha foydalanuvchilarga xabar"))
-    keyboard.add(KeyboardButton("👥 Oddiy foydalanuvchi rejimi"))
-    return keyboard
-
-
-# Create main keyboard
-def get_main_keyboard(user_id):
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add(KeyboardButton("🔗 Saytga o'tish"))
-    
-    # Check if user is admin to show admin panel button
-    cursor.execute("SELECT is_admin FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    
-    if str(user_id) in ADMIN_IDS or (result and result[0] == 1):
-        keyboard.add(KeyboardButton("👑 Admin paneli"))
-    
-    return keyboard
-
-
-@dp.message_handler(commands=['start'])
-async def send_welcome(message: types.Message):
-    user = message.from_user
-    save_user(user)
-    
-    # Check subscription
-    if await check_subscription(user.id):
-        await message.answer(
-            f"Assalomu alaykum, {user.first_name}!\n"
-            f"Botimizga xush kelibsiz. Menga savolingizni yuboring.",
-            reply_markup=get_main_keyboard(user.id)
+    if await check_membership(user_id, context):
+        await update.message.reply_text(
+            "Botga xush kelibsiz! Quyidagi tugmalardan foydalaning:", 
+            reply_markup=get_main_keyboard()
         )
     else:
-        await message.answer(
-            "Botdan foydalanish uchun quyidagi kanal va guruhga a'zo bo'ling:",
-            reply_markup=get_subscription_keyboard()
+        await update.message.reply_text(
+            "Botdan foydalanish uchun kanal va guruhga a'zo bo'ling:", 
+            reply_markup=get_membership_keyboard()
         )
 
+# Stop command
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    conn = sqlite3.connect('bot.db')
+    c = conn.cursor()
+    c.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text("Bot to'xtatildi. Qayta boshlash uchun /start buyrug'ini yuboring.")
 
-@dp.message_handler(commands=['stop'])
-async def stop_command(message: types.Message):
-    await message.answer(
-        "Bot to'xtatildi. Qayta ishlash uchun /start buyrug'ini yuboring."
+# Help command
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = """
+    Bot buyruqlari:
+    /start - Botni boshlash
+    /stop - Botni to'xtatish
+    /help - Yordam
+    /ai - Sun'iy intellekt bilan suhbat
+    /about - Biz haqimizda
+    Motivatsiya yuborish uchun oddiy xabar sifatida yozing.
+    """
+    await update.message.reply_text(help_text, reply_markup=get_main_keyboard())
+
+# About command
+async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    about_text = "Bizning loyiha haqida: Bu Telegram bot foydalanuvchilarga motivatsiya, yangiliklar va AI bilan suhbat imkonini beradi."
+    await update.message.reply_text(about_text, reply_markup=get_main_keyboard())
+
+# AI conversation
+async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_membership(update.effective_user.id, context):
+        await update.message.reply_text(
+            "AI bilan suhbatlashish uchun kanal va guruhga a'zo bo'ling:", 
+            reply_markup=get_membership_keyboard()
+        )
+        return
+    await update.message.reply_text("Gemini AI bilan suhbat boshlandi. Savolingizni yozing:")
+    context.user_data['ai_mode'] = True
+
+# Handle text messages
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+
+    if text in ["Yordam"]:
+        await help_command(update, context)
+        return
+    elif text in ["Biz haqimizda"]:
+        await about(update, context)
+        return
+    elif text == "Kanal":
+        await update.message.reply_text(f"Kanal: https://t.me/{CHANNEL_ID[1:]}")
+        return
+    elif text == "Guruh":
+        await update.message.reply_text(f"Guruh: https://t.me/{GROUP_ID[1:]}")
+        return
+    elif text == "Veb sayt":
+        await update.message.reply_text(f"Veb sayt: {WEBSITE_URL}")
+        return
+
+    if context.user_data.get('ai_mode', False):
+        try:
+            response = model.generate_content(text)
+            await update.message.reply_text(response.text)
+        except Exception as e:
+            await update.message.reply_text(f"Xato yuz berdi: {str(e)}")
+        return
+
+    # Handle motivation submission
+    conn = sqlite3.connect('bot.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO motivations (text, submitted_by, status) VALUES (?, ?, ?)", 
+              (text, user_id, 'pending'))
+    motivation_id = c.lastrowid
+    conn.commit()
+    conn.close()
+
+    # Notify admins in motivation group
+    keyboard = [
+        [InlineKeyboardButton("Qabul qilish", callback_data=f"approve_{motivation_id}"),
+         InlineKeyboardButton("Bekor qilish", callback_data=f"reject_{motivation_id}")],
+        [InlineKeyboardButton("1 kun", callback_data=f"schedule_{motivation_id}_1"),
+         InlineKeyboardButton("2 kun", callback_data=f"schedule_{motivation_id}_2"),
+         InlineKeyboardButton("3 kun", callback_data=f"schedule_{motivation_id}_3")]
+    ]
+    await context.bot.send_message(
+        MOTIVATION_GROUP_ID, 
+        f"Yangi motivatsiya:\n{text}\nYuboruvchi: @{update.effective_user.username}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
+    await update.message.reply_text("Motivatsiyangiz adminga yuborildi. Tasdiqlanishini kuting.")
 
-
-@dp.message_handler(Text(equals="👑 Admin paneli"))
-async def admin_panel(message: types.Message):
-    user_id = message.from_user.id
-    
-    # Check if user is admin
-    cursor.execute("SELECT is_admin FROM users WHERE user_id = ?", (str(user_id),))
-    result = cursor.fetchone()
-    
-    if str(user_id) in ADMIN_IDS or (result and result[0] == 1):
-        await message.answer("Admin paneliga xush kelibsiz!", reply_markup=get_admin_keyboard())
-    else:
-        await message.answer("Siz admin emassiz.")
-
-
-@dp.message_handler(Text(equals="👥 Oddiy foydalanuvchi rejimi"))
-async def user_mode(message: types.Message):
-    await message.answer(
-        "Siz oddiy foydalanuvchi rejimiga o'tdingiz.",
-        reply_markup=get_main_keyboard(message.from_user.id)
-    )
-
-
-@dp.message_handler(Text(equals="📊 Admin statistikasi"))
-@admin_required
-async def admin_stats(message: types.Message):
-    # Get total users count
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
-    
-    # Get active users in the last 24 hours
-    cursor.execute("SELECT COUNT(*) FROM users WHERE last_active >= datetime('now', '-1 day')")
-    active_users = cursor.fetchone()[0]
-    
-    # Get total conversations
-    cursor.execute("SELECT COUNT(*) FROM conversations")
-    total_conversations = cursor.fetchone()[0]
-    
-    await message.answer(
-        f"📊 Bot statistikasi:\n\n"
-        f"👥 Jami foydalanuvchilar: {total_users}\n"
-        f"🔄 Faol foydalanuvchilar (24 soat): {active_users}\n"
-        f"💬 Jami suhbatlar: {total_conversations}"
-    )
-
-
-@dp.message_handler(Text(equals="👤 Admin qo'shish"))
-@admin_required
-async def add_admin_start(message: types.Message):
-    await AdminStates.waiting_for_admin_id.set()
-    await message.answer("Yangi admin ID raqamini kiriting:")
-
-
-@dp.message_handler(state=AdminStates.waiting_for_admin_id)
-@admin_required
-async def add_admin_process(message: types.Message, state: FSMContext):
-    try:
-        new_admin_id = message.text.strip()
-        
-        # Check if user exists
-        cursor.execute("SELECT * FROM users WHERE user_id = ?", (new_admin_id,))
-        user = cursor.fetchone()
-        
-        if not user:
-            await message.answer("Bu ID raqamli foydalanuvchi topilmadi. Foydalanuvchi avval botdan foydalangan bo'lishi kerak.")
-            await state.finish()
-            return
-        
-        # Update user as admin
-        cursor.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?", (new_admin_id,))
-        conn.commit()
-        
-        await message.answer(f"Foydalanuvchi (ID: {new_admin_id}) admin qilib tayinlandi.")
-    except Exception as e:
-        await message.answer(f"Xatolik yuz berdi: {str(e)}")
-    
-    await state.finish()
-
-
-@dp.message_handler(Text(equals="🚫 Adminlikdan olish"))
-@admin_required
-async def remove_admin_start(message: types.Message):
-    await AdminStates.waiting_for_admin_action.set()
-    await message.answer("Adminlikdan olib tashlanadigan foydalanuvchi ID raqamini kiriting:")
-
-
-@dp.message_handler(state=AdminStates.waiting_for_admin_action)
-@admin_required
-async def remove_admin_process(message: types.Message, state: FSMContext):
-    try:
-        admin_id = message.text.strip()
-        
-        # Admin cannot remove themselves or super admins from .env
-        if str(message.from_user.id) == admin_id:
-            await message.answer("Siz o'zingizni adminlikdan olib tashlay olmaysiz.")
-            await state.finish()
-            return
-        
-        if admin_id in ADMIN_IDS:
-            await message.answer("Asosiy adminlarni olib tashlab bo'lmaydi.")
-            await state.finish()
-            return
-        
-        # Update user to remove admin status
-        cursor.execute("UPDATE users SET is_admin = 0 WHERE user_id = ?", (admin_id,))
-        conn.commit()
-        
-        await message.answer(f"Foydalanuvchi (ID: {admin_id}) adminlikdan olindi.")
-    except Exception as e:
-        await message.answer(f"Xatolik yuz berdi: {str(e)}")
-    
-    await state.finish()
-
-
-@dp.message_handler(Text(equals="📝 Barcha foydalanuvchilarga xabar"))
-@admin_required
-async def broadcast_start(message: types.Message):
-    await AdminStates.waiting_for_message.set()
-    await message.answer("Barcha foydalanuvchilarga yuboriladigan xabarni kiriting:")
-
-
-@dp.message_handler(state=AdminStates.waiting_for_message)
-@admin_required
-async def broadcast_message(message: types.Message, state: FSMContext):
-    broadcast_text = message.text
-    
-    # Get all users
-    cursor.execute("SELECT user_id FROM users")
-    users = cursor.fetchall()
-    
-    sent_count = 0
-    error_count = 0
-    
-    await message.answer("Xabar yuborish boshlandi...")
-    
+# Admin broadcast
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Bu buyruq faqat adminlar uchun.")
+        return
+    if not context.args:
+        await update.message.reply_text("Xabar yuborish uchun matn kiriting: /broadcast Xabar matni")
+        return
+    message = " ".join(context.args)
+    conn = sqlite3.connect('bot.db')
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE is_active = 1")
+    users = c.fetchall()
     for user in users:
         try:
-            await bot.send_message(user[0], f"📢 ADMIN XABARI:\n\n{broadcast_text}")
-            sent_count += 1
+            await context.bot.send_message(user[0], message)
         except Exception as e:
-            logging.error(f"Error sending message to {user[0]}: {e}")
-            error_count += 1
-    
-    await message.answer(
-        f"Xabar yuborish yakunlandi.\n"
-        f"✅ Yuborildi: {sent_count}\n"
-        f"❌ Xatolik: {error_count}"
-    )
-    await state.finish()
+            logger.error(f"Error sending broadcast to {user[0]}: {e}")
+    conn.close()
+    await update.message.reply_text("Xabar barcha foydalanuvchilarga yuborildi.")
 
+# Callback queries
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    await query.answer()
 
-@dp.message_handler(Text(equals="🔗 Saytga o'tish"))
-async def website_link(message: types.Message):
-    # Check subscription before providing link
-    if not await check_subscription(message.from_user.id):
-        await message.answer(
-            "Botdan foydalanish uchun quyidagi kanal va guruhga a'zo bo'ling:",
-            reply_markup=get_subscription_keyboard()
-        )
+    if data == "check_membership":
+        if await check_membership(query.from_user.id, context):
+            await query.message.edit_text("Tabriklaymiz! Endi botdan foydalanishingiz mumkin.", 
+                                         reply_markup=None)
+            await context.bot.send_message(query.from_user.id, 
+                                          "Botga xush kelibsiz!", 
+                                          reply_markup=get_main_keyboard())
+        else:
+            await query.message.edit_text("Iltimos, kanal va guruhga a'zo bo'ling:", 
+                                         reply_markup=get_membership_keyboard())
         return
-    
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("🌐 Saytga o'tish", url="https://example.com"))
-    
-    await message.answer("Saytimizga tashrif buyuring:", reply_markup=keyboard)
 
+    if data.startswith("approve_"):
+        motivation_id = int(data.split("_")[1])
+        conn = sqlite3.connect('bot.db')
+        c = conn.cursor()
+        c.execute("UPDATE motivations SET status = 'approved' WHERE id = ?", (motivation_id,))
+        c.execute("SELECT text FROM motivations WHERE id = ?", (motivation_id,))
+        text = c.fetchone()[0]
+        conn.commit()
+        conn.close()
 
-@dp.callback_query_handler(text="check_subscription")
-async def check_subscription_callback(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
-    
-    if await check_subscription(callback_query.from_user.id):
-        await bot.send_message(
-            callback_query.from_user.id,
-            "✅ Siz kanalga va guruhga a'zo bo'lgansiz! Botdan foydalanishingiz mumkin.",
-            reply_markup=get_main_keyboard(callback_query.from_user.id)
-        )
-    else:
-        await bot.send_message(
-            callback_query.from_user.id,
-            "❌ Siz hali kerakli kanal va guruhga a'zo bo'lmagansiz.",
-            reply_markup=get_subscription_keyboard()
-        )
+        # Send to all users with like/share buttons
+        keyboard = [
+            [InlineKeyboardButton("👍 Like", callback_data=f"like_{motivation_id}"),
+             InlineKeyboardButton("📤 Ulashish", switch_inline_query=text)]
+        ]
+        conn = sqlite3.connect('bot.db')
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users WHERE is_active = 1")
+        users = c.fetchall()
+        for user in users:
+            try:
+                await context.bot.send_message(user[0], text, reply_markup=InlineKeyboardMarkup(keyboard))
+            except Exception as e:
+                logger.error(f"Error sending motivation to {user[0]}: {e}")
+        conn.close()
+        await query.message.edit_text(f"Motivatsiya tasdiqlandi va yuborildi:\n{text}")
 
+    elif data.startswith("reject_"):
+        motivation_id = int(data.split("_")[1])
+        conn = sqlite3.connect('bot.db')
+        c = conn.cursor()
+        c.execute("UPDATE motivations SET status = 'rejected' WHERE id = ?", (motivation_id,))
+        conn.commit()
+        conn.close()
+        await query.message.edit_text("Motivatsiya bekor qilindi.")
 
-@dp.message_handler()
-async def process_message(message: types.Message):
-    user_id = message.from_user.id
-    save_user(message.from_user)
-    
-    # Check subscription before processing message
-    if not await check_subscription(user_id):
-        await message.answer(
-            "Botdan foydalanish uchun quyidagi kanal va guruhga a'zo bo'ling:",
-            reply_markup=get_subscription_keyboard()
-        )
-        return
-    
-    # Process with Gemini AI
-    try:
-        user_message = message.text
-        
-        # Skip special commands for admin panel
-        if user_message in ["👑 Admin paneli", "📊 Admin statistikasi", "👤 Admin qo'shish", 
-                         "🚫 Adminlikdan olish", "📝 Barcha foydalanuvchilarga xabar", 
-                         "👥 Oddiy foydalanuvchi rejimi", "🔗 Saytga o'tish"]:
-            return
-        
-        # Send typing action
-        await bot.send_chat_action(message.chat.id, "typing")
-        
-        # Get response from Gemini
-        response = model.generate_content(user_message)
-        response_text = response.text
-        
-        await message.answer(response_text)
-        
-        # Save conversation to database
-        save_conversation(user_id, user_message, response_text)
-        
-    except Exception as e:
-        logging.error(f"Error processing message: {e}")
-        await message.answer("Xatolik yuz berdi. Iltimos, keyinroq qayta urinib ko'ring.")
+    elif data.startswith("schedule_"):
+        motivation_id, days = data.split("_")[1], data.split("_")[2]
+        schedule_date = (datetime.now() + timedelta(days=int(days))).strftime('%Y-%m-%d')
+        conn = sqlite3.connect('bot.db')
+        c = conn.cursor()
+        c.execute("UPDATE motivations SET status = 'approved', schedule_date = ? WHERE id = ?", 
+                  (schedule_date, motivation_id))
+        conn.commit()
+        conn.close()
+        await query.message.edit_text(f"Motivatsiya {days} kundan keyin yuboriladi.")
 
+    elif data.startswith("like_"):
+        await query.message.edit_text(f"{query.message.text}\n👍 Sizga yoqdi!")
 
-if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
+# Daily motivation
+def send_daily_motivation(context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect('bot.db')
+    c = conn.cursor()
+    c.execute("SELECT text FROM motivations WHERE status = 'approved' AND (schedule_date IS NULL OR schedule_date = ?)", 
+              (datetime.now().strftime('%Y-%m-%d'),))
+    motivations = c.fetchall()
+    if motivations:
+        motivation = random.choice(motivations)[0]
+        c.execute("SELECT user_id FROM users WHERE is_active = 1")
+        users = c.fetchall()
+        for user in users:
+            try:
+                context.job_queue.run_once(
+                    lambda ctx: ctx.bot.send_message(user[0], motivation, 
+                                                   reply_markup=InlineKeyboardMarkup([
+                                                       [InlineKeyboardButton("👍 Like", callback_data="like_daily"),
+                                                        InlineKeyboardButton("📤 Ulashish", switch_inline_query=motivation)]
+                                                   ])),
+                    0
+                )
+            except Exception as e:
+                logger.error(f"Error sending daily motivation to {user[0]}: {e}")
+    conn.close()
+
+# Schedule daily motivation at 8:00 AM
+schedule.every().day.at("08:00").do(lambda: send_daily_motivation)
+
+async def run_scheduler():
+    while True:
+        schedule.run_pending()
+        await asyncio.sleep(60)
+
+def main():
+    init_db()
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("ai", ai_command))
+    app.add_handler(CommandHandler("about", about))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Run scheduler in background
+    asyncio.get_event_loop().create_task(run_scheduler())
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
